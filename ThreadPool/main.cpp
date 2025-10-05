@@ -1,195 +1,248 @@
 #include <iostream>
-#include <chrono>   // 用于 std::chrono::seconds
-#include <numeric>  // 用于 std::accumulate
+#include <chrono>
+#include <vector>
+#include <numeric>
+
+// 包含你编写的线程池头文件
 #include "ThreadPool.hpp"
 
-// 用于测试的全局原子计数器，保证多线程修改安全
-std::atomic<int> g_task_count{0};
+// 用于测试的全局原子计数器
+std::atomic<int> g_task_counter{0};
+// 用于输出同步的互斥锁
+std::mutex g_cout_mutex;
 
-
-// --- 测试用例函数 ---
-
-// 任务1：简单的任务
-void simple_task() {
-    std::cout << "  > simple_task anan 执行中... (线程ID: " << std::this_thread::get_id() << ")\n";
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    g_task_count++;
+// Helper to print thread-safe messages
+template<typename... Args>
+void print_safe(Args&&... args) {
+    std::lock_guard<std::mutex> lock(g_cout_mutex);
+    (std::cout << ... << args) << std::endl;
 }
 
-// 任务2：带参数和返回值的任务
-int sum_task(int start, int end) {
-    std::cout << "  > sum_task anan 执行中... (线程ID: " << std::this_thread::get_id() << ")\n";
-    int sum = 0;
-    for (int i = start; i <= end; ++i) {
-        sum += i;
-    }
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    return sum;
+// 打印测试标题的辅助函数
+void print_header(const std::string& title) {
+    print_safe("\n=================================================");
+    print_safe("  ", title);
+    print_safe("=================================================");
 }
 
-// 任务3：会抛出异常的任务
-void exception_task() {
-    std::cout << "  > exception_task anan 执行中，准备抛出异常... (线程ID: " << std::this_thread::get_id() << ")\n";
-    throw std::runtime_error("这是一个测试异常");
-}
+// --- 测试用例 ---
 
-// --- 测试场景 ---
-
-// 场景1：测试基本提交和 future 返回值
 void test_basic_and_future() {
-    std::cout << "\n--- [测试场景 1: 基本任务提交与 Future 返回值] ---\n";
-    xdg::ThreadPool pool(2, 4); // 2个线程，队列容量4
+    print_header("测试 1: 基本提交与 Future");
+    xdg::ThreadPool pool(2); // 创建2个线程的线程池
     pool.start();
-    std::cout << "线程池已启动...\n";
+    print_safe("线程池已启动。");
 
-    // 1. 提交一个简单任务
-    std::cout << "提交 simple_task (无返回值)...\n";
-    pool.submit(simple_task);
+    g_task_counter = 0;
 
-    // 2. 提交一个带返回值的任务
-    std::cout << "提交 sum_task (1 到 100)...\n";
-    std::future<int> future_sum = pool.submitTask(sum_task, 1, 100);
-
-    // 3. 在主线程做点别的事情
-    std::cout << "主线程等待 future 结果...\n";
-    
-    // 4. 获取任务结果 (get() 会阻塞直到结果准备好)
-    int sum_result = future_sum.get();
-    std::cout << "sum_task 结果已获取: " << sum_result << " (预期: 5050)\n";
-    if (sum_result == 5050) {
-        std::cout << "[OK] 返回值正确。\n";
-    } else {
-        std::cout << "[FAIL] 返回值错误。\n";
-    }
-
-    // 等待 simple_task 执行完毕
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-    if (g_task_count.load() == 1) {
-        std::cout << "[OK] fire-and-forget 任务已执行。\n";
-    } else {
-        std::cout << "[FAIL] fire-and-forget 任务未执行。\n";
-    }
-
-    pool.destroy();
-    std::cout << "线程池已销毁。\n";
-}
-
-// 场景2：测试有界队列的阻塞行为
-void test_bounded_queue() {
-    std::cout << "\n--- [测试场景 2: 有界队列阻塞] ---\n";
-    // 1个线程，队列容量1。这样很容易测试阻塞
-    xdg::ThreadPool pool(1, 1);
-    pool.start();
-    std::cout << "线程池已启动 (1个线程, 队列容量1)...\n";
-
-    // 1. 提交一个耗时2秒的任务，它会立刻被执行，占满线程
-    std::cout << "提交一个耗时2秒的任务...\n";
+    // 1. 测试 fire-and-forget (即发即忘)
     pool.submit([]{
-        std::cout << "  > 长任务开始... (线程ID: " << std::this_thread::get_id() << ")\n";
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        std::cout << "  > 长任务结束。\n";
+        print_safe("  > (任务 A) fire-and-forget 任务正在执行...");
+        g_task_counter++;
     });
 
-    // 2. 再提交一个任务，它会进入队列，占满队列
-    std::cout << "提交第二个任务 (将会填满队列)...\n";
-    pool.submit(simple_task);
+    // 2. 测试带返回值的任务
+    auto future = pool.submitTask([](int a, int b) {
+        print_safe("  > (任务 B) 带返回值的任务正在执行...");
+        return a + b;
+    }, 10, 20);
 
-    // 3. 主线程尝试提交第三个任务，此时线程和队列都满了，submit 调用应该会阻塞
-    std::cout << "主线程准备提交第三个任务，预期将在此阻塞...\n";
-    auto start_time = std::chrono::high_resolution_clock::now();
-    
-    pool.submit([]{
-        std::cout << "  > 第三个任务终于被执行了... (线程ID: " << std::this_thread::get_id() << ")\n";
-        g_task_count++;
-    });
+    print_safe("主线程：等待任务 B 的结果...");
+    int result = future.get(); // get() 会阻塞直到结果返回
+    print_safe("主线程：任务 B 的结果是: ", result, " (预期: 30)");
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-
-    std::cout << "主线程阻塞结束，耗时: " << duration.count() << "ms\n";
-
-    if (duration.count() > 1000) {
-        std::cout << "[OK] 生产者线程 (主线程) 成功被阻塞。\n";
+    if (result == 30) {
+        print_safe("[OK] Future 返回值正确。");
     } else {
-        std::cout << "[FAIL] 生产者线程未按预期阻塞。\n";
+        print_safe("[FAIL] Future 返回值错误。");
     }
 
-    pool.destroy();
-    std::cout << "线程池已销毁。\n";
+    // 等待任务 A 执行完毕
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (g_task_counter.load() == 1) {
+        print_safe("[OK] fire-and-forget 任务已执行。");
+    } else {
+        print_safe("[FAIL] fire-and-forget 任务未执行。");
+    }
+
+    pool.destroy(false); // 优雅关闭
+    print_safe("线程池已销毁。");
 }
 
-// 场景3：测试异常处理
+void test_shutdown_modes() {
+    print_header("测试 2: 两种关闭模式 (优雅 vs 立即)");
+    
+    // --- 优雅关闭测试 ---
+    print_safe("\n--- 子测试: 优雅关闭 (destroy(false)) ---");
+    xdg::ThreadPool pool_graceful(1);
+    pool_graceful.start();
+    g_task_counter = 0;
+    
+    print_safe("提交一个耗时100ms的任务...");
+    pool_graceful.submit([]{
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        g_task_counter++;
+    });
+    print_safe("提交3个计数任务...");
+    pool_graceful.submit([]{ g_task_counter++; });
+    pool_graceful.submit([]{ g_task_counter++; });
+    pool_graceful.submit([]{ g_task_counter++; });
+
+    print_safe("调用 destroy(false)，主线程将等待所有4个任务完成...");
+    pool_graceful.destroy(false); // 优雅关闭
+    print_safe("优雅关闭完成。");
+    
+    if (g_task_counter.load() == 4) {
+        print_safe("[OK] 优雅关闭：所有4个任务都已执行。");
+    } else {
+        print_safe("[FAIL] 优雅关闭：任务执行不完整，计数: ", g_task_counter.load());
+    }
+
+    // --- 立即关闭测试 ---
+    print_safe("\n--- 子测试: 立即关闭 (destroy(true)) ---");
+    xdg::ThreadPool pool_immediate(1);
+    pool_immediate.start();
+    g_task_counter = 0;
+
+    print_safe("提交一个耗时500ms的任务...");
+    pool_immediate.submit([]{
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        g_task_counter++; // 这个任务应该会开始执行
+    });
+     // 快速提交另外3个任务到队列
+    pool_immediate.submit([]{ g_task_counter++; });
+    pool_immediate.submit([]{ g_task_counter++; });
+    pool_immediate.submit([]{ g_task_counter++; });
+
+    // 在队列中的任务被执行前，立刻销毁
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    print_safe("调用 destroy(true)，队列中未执行的任务将被丢弃...");
+    pool_immediate.destroy(true); // 立即关闭
+    print_safe("立即关闭完成。");
+
+    if (g_task_counter.load() <= 1) {
+        print_safe("[OK] 立即关闭：只有正在执行的任务完成了，计数: ", g_task_counter.load());
+    } else {
+        print_safe("[FAIL] 立即关闭：队列中的任务被错误地执行了，计数: ", g_task_counter.load());
+    }
+}
+
 void test_exception_handling() {
-    std::cout << "\n--- [测试场景 3: 异常处理] ---\n";
+    print_header("测试 3: 异常安全");
     xdg::ThreadPool pool(2);
     pool.start();
-    std::cout << "线程池已启动...\n";
-    
-    // 1. 测试 fire-and-forget 任务的异常 (我们应该能在 stderr 看到 worker_loop 的打印)
-    std::cout << "提交一个会抛出异常的 fire-and-forget 任务...\n";
-    pool.submit(exception_task);
+
+    // 1. 测试 fire-and-forget 任务的异常
+    print_safe("提交一个会抛异常的 fire-and-forget 任务 (应在 stderr 看到错误信息)...");
+    pool.submit([]{
+        throw std::logic_error("fire-and-forget 异常测试");
+    });
 
     // 2. 测试带 future 任务的异常
-    std::cout << "提交一个会抛出异常的 future 任务...\n";
-    std::future<void> future_exc = pool.submitTask(exception_task);
-
+    print_safe("提交一个会抛异常的 future 任务...");
+    auto future = pool.submitTask([]{
+        throw std::runtime_error("future 异常传播测试");
+    });
+    
     try {
-        std::cout << "主线程调用 future.get()，预期会捕获到异常...\n";
-        future_exc.get();
+        print_safe("主线程调用 future.get()，预期会捕获到异常...");
+        future.get();
     } catch (const std::runtime_error& e) {
-        std::cout << "[OK] 成功在主线程捕获到异常: " << e.what() << "\n";
+        print_safe("[OK] 成功从 future 捕获到异常: ", e.what());
     } catch (...) {
-        std::cout << "[FAIL] 捕获到未知异常。\n";
+        print_safe("[FAIL] 从 future 捕获到未知异常。");
     }
-    
-    // 给第一个任务一点时间，确保它的异常信息能被打印出来
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    
-    pool.destroy();
-    std::cout << "线程池已销毁。\n";
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    pool.destroy(false);
+    print_safe("线程池已销毁。");
 }
 
-
-// 场景4：测试重复启停
 void test_resettable() {
-    std::cout << "\n--- [测试场景 4: 重复启停] ---\n";
+    print_header("测试 4: 重复启停");
     xdg::ThreadPool pool(1);
-    
-    std::cout << "第一次启动线程池...\n";
-    pool.start();
-    auto future1 = pool.submitTask([]{ return 42; });
-    int res1 = future1.get();
-    std::cout << "第一次运行结果: " << res1 << " (预期: 42)\n";
-    if (res1 == 42) std::cout << "[OK] 第一次运行正常。\n";
-    else std::cout << "[FAIL] 第一次运行失败。\n";
-    pool.destroy();
-    std::cout << "第一次销毁完成。\n";
 
-    std::cout << "\n第二次启动同一个线程池...\n";
+    print_safe("--- 第一次运行 ---");
     pool.start();
-    auto future2 = pool.submitTask([]{ return 99; });
-    int res2 = future2.get();
-    std::cout << "第二次运行结果: " << res2 << " (预期: 99)\n";
-    if (res2 == 99) std::cout << "[OK] 第二次运行正常。\n";
-    else std::cout << "[FAIL] 第二次运行失败。\n";
-    pool.destroy();
-    std::cout << "第二次销毁完成。\n";
+    auto fut1 = pool.submitTask([]{ return 1; });
+    if (fut1.get() == 1) print_safe("[OK] 第一次运行结果正确。");
+    else print_safe("[FAIL] 第一次运行结果错误。");
+    pool.destroy(false);
+    print_safe("第一次销毁完成。");
+
+    print_safe("\n--- 第二次运行 ---");
+    pool.start();
+    auto fut2 = pool.submitTask([]{ return 2; });
+    if (fut2.get() == 2) print_safe("[OK] 第二次运行结果正确。");
+    else print_safe("[FAIL] 第二次运行结果错误。");
+    pool.destroy(false);
+    print_safe("第二次销毁完成。");
+}
+
+void test_stress() {
+    print_header("测试 5: 并发压力测试");
+    const int num_producers = 4;
+    const int tasks_per_producer = 500;
+    xdg::ThreadPool pool(4); // 4个工作线程
+    pool.start();
+    g_task_counter = 0;
+
+    print_safe("启动 ", num_producers, " 个生产者线程，每个提交 ", tasks_per_producer, " 个任务...");
+    std::vector<std::thread> producers;
+    for (int i = 0; i < num_producers; ++i) {
+        producers.emplace_back([&pool, tasks_per_producer]{
+            for (int j = 0; j < tasks_per_producer; ++j) {
+                pool.submit([]{ g_task_counter++; });
+            }
+        });
+    }
+
+    // 等待所有生产者线程完成任务提交
+    for (auto& t : producers) {
+        t.join();
+    }
+    print_safe("所有生产者已提交完毕。");
+
+    print_safe("等待线程池完成所有任务 (优雅关闭)...");
+    pool.destroy(false);
+    print_safe("压力测试销毁完成。");
+
+    int expected_count = num_producers * tasks_per_producer;
+    if (g_task_counter.load() == expected_count) {
+        print_safe("[OK] 压力测试通过，所有任务都已执行，最终计数: ", g_task_counter.load());
+    } else {
+        print_safe("[FAIL] 压力测试失败，预期计数 ", expected_count, ", 实际计数: ", g_task_counter.load());
+    }
 }
 
 
-int main() {
+int main() 
+{
+    // 测试 1: 验证最基本的功能。
+    // - 提交一个不需要返回值的"即发即忘"任务。
+    // - 提交一个需要返回值的任务，并通过 std::future 来等待并获取结果。
+    test_basic_and_future();
 
-    auto start_time = std::chrono::high_resolution_clock::now(); // 开始计时
+    // 测试 2: 验证两种不同的销毁模式。
+    // - "优雅关闭" (destroy(false))：验证它会等待队列中所有剩余任务执行完毕。
+    // - "立即关闭" (destroy(true))：验证它会清空任务队列，丢弃所有未开始执行的任务。
+    test_shutdown_modes();
 
-    test_basic_and_future(); // 测试基础功能和 future
-    test_bounded_queue(); // 测试有界队列的阻塞行为
-    test_exception_handling(); // 测试异常处理
-    test_resettable(); // 测试重复启停
+    // 测试 3: 验证线程池的健壮性和异常安全。
+    // - 验证在工作线程中抛出的异常能被安全捕获，而不会使整个程序或线程池崩溃。
+    // - 验证任务的异常可以通过 std::future 正确地传递给提交任务的主线程。
+    test_exception_handling();
 
-    auto end_time = std::chrono::high_resolution_clock::now();
+    // 测试 4: 验证线程池的生命周期管理是否灵活。
+    // - 验证线程池在被 destroy() 之后，可以被重新 start() 并再次正常工作。
+    test_resettable();
 
-    std::cout << "\n所有测试已完成。\n";
-    std::cout << "总耗时: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count() << "ms\n";
+    // 测试 5: 验证高并发下的表现和正确性。
+    // - 模拟多个“生产者”线程同时、大量地向线程池提交任务。
+    // - 验证在锁竞争的情况下，所有任务最终是否都能被正确执行，没有任何丢失。
+    test_stress();
+
+    print_safe("\n所有测试已完成。");
 
     return 0;
 }

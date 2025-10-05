@@ -1,6 +1,7 @@
 #ifndef _THREAD_POOL_HPP_
 #define _THREAD_POOL_HPP_
 
+#include <iostream>
 #include <string>
 #include <vector>
 #include <deque>
@@ -42,8 +43,10 @@ public:
 
     /*
     * 销毁线程池
+    * @param immediate 如果为 true，则立刻清空任务队列并销毁；
+    * 如果为 false，将拒绝新的提交并等待队列完成，并等待所有已提交的任务执行完毕后再销毁。
     */
-    void destroy();
+    void destroy(bool immediate = false); // 默认行为是立刻销毁
 
     /*
     * 获取工作线程数量
@@ -70,8 +73,8 @@ public:
     * @return 返回 std::future，用于获取任务执行结果
     */
     template <typename F, typename... Args>
-    auto submitTask(F&& f, Args&&... args) ->
-        std::future<typename std::decay<decltype(std::forward<F>(f)(std::forward<Args>(args)...))>::type>;
+    auto submitTask(F&& f, Args&&... args)
+        -> std::future<typename std::decay<typename std::result_of<F(Args...)>::type>::type>;
 
     /*
     * 向线程池提交异步任务 (即发即忘)
@@ -83,6 +86,8 @@ public:
 
 /************************私有成员变量和函数************************/
 private:
+    ThreadPool(const ThreadPool&) = delete; // 禁止拷贝构造
+    ThreadPool& operator=(const ThreadPool&) = delete; // 禁止赋值运算符
     /**
     * 工作线程函数，每个线程启动后都会循环执行此函数
     */
@@ -98,7 +103,6 @@ private:
     std::atomic<int> m_Status;           // 线程池状态
     std::atomic<bool> m_stopFlag;        // 线程池停止标志
     std::mutex m_lifecycleMutex;         // 用于保护 start/destroy 的互斥锁
-    std::once_flag m_startFlag;          // 用于保证 start 逻辑只被调用一次
 
     // --- 任务队列与同步机制 (单锁模型) ---
     std::mutex m_queueMutex;             // 【修改】唯一的、保护任务队列的互斥锁
@@ -134,12 +138,18 @@ inline ThreadPool::ThreadPool(unsigned int ThreadCount, int QueueSize)
     } else {
         m_QueueSize = QueueSize; // 接受用户指定的正数值，或者 -1 代表无界
     }
+
 }
 
-// 析构函数：确保线程池在对象销毁时能被正确关闭
+// 析构函数：默认执行“优雅关闭”，避免数据丢失
 inline ThreadPool::~ThreadPool()
 {
-    destroy();
+    // 在析构中做“优雅关闭”的默认行为（等待队列任务执行完） 注意：析构函数内不能抛异常
+    try {
+        destroy(false); // 调用优雅关闭，等待所有任务完成。这是最安全的默认行为。
+    } catch (...) {
+        // 保证析构不抛异常；可以用日志记录
+    }
 }
 
 // 开启线程池 (支持重复启动)
@@ -157,35 +167,55 @@ inline int ThreadPool::start()
     m_stopFlag.store(false);
 
     // 创建并启动工作线程
+    m_Threads.clear();
     m_Threads.reserve(m_ThreadCount);
-    for (unsigned int i = 0; i < m_ThreadCount; ++i) {
-        m_Threads.emplace_back(&ThreadPool::worker_loop, this);
+
+    try {
+        for (unsigned int i = 0; i < m_ThreadCount; ++i) {
+            m_Threads.emplace_back(&ThreadPool::worker_loop, this);
+        }
+        m_Status = 0;
+    } catch (...) {
+        // 创建线程过程中抛出：清理已创建线程
+        m_stopFlag.store(true);
+        for (auto &t : m_Threads) {
+            if (t.joinable()) t.join();
+        }
+        m_Threads.clear();
+        m_Status = -1;
+        throw;
     }
-    m_Status = 0; // 设置状态为运行中
 
     return m_ThreadCount;
 }
 
-// 销毁线程池 (为重启做准备)
-inline void ThreadPool::destroy()
+
+// 销毁线程池 (支持两种模式)
+inline void ThreadPool::destroy(bool immediate)
 {
-    // 使用互斥锁保护，防止多线程同时调用
+    // 使用互斥锁保护，确保 destroy 函数是线程安全的
     std::lock_guard<std::mutex> lock(m_lifecycleMutex);
 
     if (m_Status == -1) {
         return; // 如果已销毁，直接返回
     }
 
-    // 步骤1：设置停止标志并清空任务队列
+    // 步骤1：设置停止标志，并根据模式决定是否清空任务队列
     {
-        // 锁住任务队列，确保在清空和设置标志时没有其他线程在操作队列
         std::lock_guard<std::mutex> queueLock(m_queueMutex);
+        
+        // 通知生产者不能再提交任务
         m_stopFlag.store(true);
-        // 清空所有待处理的任务，为下一次 start 做准备
-        m_TaskQueue.clear(); 
+
+        if (immediate) {
+            // 立刻销毁模式：清空所有待处理的任务
+            m_TaskQueue.clear(); 
+        }
+        // 优雅关闭模式：不清空队列，让工作线程继续执行
     }
 
     // 步骤2：唤醒所有可能在等待的线程
+    // 无论是生产者还是消费者，都需要被唤醒，以便它们能观察到 m_stopFlag 的变化
     m_notFull.notify_all();
     m_notEmpty.notify_all();
 
@@ -204,7 +234,7 @@ inline void ThreadPool::destroy()
 // 工作线程函数 (消费者)
 inline void ThreadPool::worker_loop()
 {
-    while (!m_stopFlag.load()) {
+    while (1) {
         std::function<void()> task; // 任务函数
 
         {
@@ -216,27 +246,29 @@ inline void ThreadPool::worker_loop()
                 return m_stopFlag.load() || !m_TaskQueue.empty();
             });
 
-            // 被唤醒后，优先检查是否是因停止信号而醒来
+            // 【关键的退出逻辑】
+            // 这是整个循环唯一的、正确的退出点。
+            // 它确保了即使 m_stopFlag 为 true，只要队列中还有任务，循环就不会退出。
             if (m_stopFlag.load() && m_TaskQueue.empty()) {
                 return; // 退出循环，线程结束
             }
 
-            // 从队列头部取出一个任务
+            // 如果能走到这里，说明队列必定不为空，从队列头部取出一个任务
             task = std::move(m_TaskQueue.front());
             m_TaskQueue.pop_front();
 
-            // 通知一个可能正在等待的生产者：队列有空位了
-            m_notFull.notify_one();
-
         } // 锁释放
+
+        // 通知一个可能正在等待的生产者：队列有空位了
+        m_notFull.notify_one();
 
         // 在锁之外执行任务，避免任务执行时间过长而阻塞其他线程
         try {
             if (task) task();
         } catch (const std::exception& e) {
-            fprintf(stderr, "Task threw a standard exception: %s\n", e.what());
+            std::cerr << "Task threw a standard exception: " << e.what() << std::endl;
         } catch (...) {
-            fprintf(stderr, "Task threw a non-standard or unknown exception.\n");
+            std::cerr << "Task threw an unknown exception.\n";
         }
 
     } // while (!m_stopFlag.load()) 结束
@@ -244,52 +276,103 @@ inline void ThreadPool::worker_loop()
 
 // 提交任务，带返回值 (生产者)
 template <typename F, typename... Args>
-inline auto ThreadPool::submitTask(F&& f, Args&&... args) ->
-    std::future<typename std::decay<decltype(std::forward<F>(f)(std::forward<Args>(args)...))>::type>
+inline auto ThreadPool::submitTask(F&& f, Args&&... args)
+    -> std::future<typename std::decay<typename std::result_of<F(Args...)>::type>::type>
 {
-    using return_type = typename std::decay<decltype(std::forward<F>(f)(std::forward<Args>(args)...))>::type;
+    using result_t = typename std::decay<typename std::result_of<F(Args...)>::type>::type;
 
-    std::unique_lock<std::mutex> lock(m_queueMutex); // 使用唯一的队列锁
+    // promise + future（使用 shared_ptr 以便在 lambda/catch 路径中共享）
+    auto prom = std::make_shared<std::promise<result_t>>();
+    std::future<result_t> fut = prom->get_future();
 
-    // 等待直到“队列不满”或“线程池停止”
-    m_notFull.wait(lock, [this] {
-        return m_stopFlag.load() || (m_QueueSize == -1 || m_TaskQueue.size() < m_QueueSize);
-    });
+    // C++11 下使用 std::bind 将可调用对象与参数绑定
+    auto bound = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
 
-    if (m_stopFlag.load()) {
-        throw std::runtime_error("submitTask on a stopped ThreadPool");
-    }
+    // 构造任务：执行 bound 并把结果/异常写入 promise
+    auto task = [prom, bound]() mutable {
+        try {
+            if (std::is_void<result_t>::value) {
+                bound();               // 执行
+                prom->set_value();     // void 特殊处理
+            } else {
+                prom->set_value(bound());
+            }
+        } catch (...) {
+            prom->set_exception(std::current_exception());
+        }
+    };
 
-    auto bound_task = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
-    auto task_ptr = std::make_shared<std::packaged_task<return_type()>>(bound_task);
-    std::future<return_type> future = task_ptr->get_future();
-    m_TaskQueue.emplace_back([task_ptr]() {
-        (*task_ptr)();
-    });
 
-    // 通知一个可能正在等待的消费者：有新任务了
+    // 将任务放入队列：在任何抛出路径上设置 promise 的异常，避免 future 永远等待
+    {
+        std::unique_lock<std::mutex> lock(m_queueMutex);
+        m_notFull.wait(lock, [this] {
+            return m_stopFlag.load() || (m_QueueSize == -1 || (int)m_TaskQueue.size() < m_QueueSize);
+        });
+
+        if (m_stopFlag.load()) {
+            // 把异常传给 future，再抛异常给调用者
+            prom->set_exception(std::make_exception_ptr(std::runtime_error("submitTask on a stopped ThreadPool")));
+            throw std::runtime_error("submitTask on a stopped ThreadPool");
+        }
+
+        try {
+            m_TaskQueue.emplace_back(std::move(task));
+        } catch (...) {
+            // emplace_back（如 bad_alloc）抛出时，必须把异常传给 promise，避免 future 永远等待
+            prom->set_exception(std::current_exception());
+            throw;
+        }
+
+        
+    } // 锁释放
+    // 唤醒一个可能正在等待的消费者
     m_notEmpty.notify_one();
-
-    return future;
+    return fut;
 }
 
 // 提交任务，无返回值 (生产者)
 template <typename F, typename... Args>
 inline void ThreadPool::submit(F&& f, Args&&... args)
 {
-    std::unique_lock<std::mutex> lock(m_queueMutex); // 使用唯一的队列锁
+    // 在函数体内声明类型别名（C++11 支持）
+    using Task = std::function<void()>;
 
+    // 先把可调用对象与参数绑定（可能抛出，但在锁外更好）
+    auto bound = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
+
+    // 用 Task 封装，任务内部捕获异常防止线程终止
+    Task task = [bound]() mutable {
+        try {
+            bound();
+        } catch (const std::exception& e) {
+            // 可选：记录或上报错误，避免异常传播导致线程退出
+            std::cerr << "fire-and-forget task threw a standard exception: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "fire-and-forget task threw an unknown exception.\n";
+        }
+    };
+
+    // 将任务推入队列（在锁内操作队列结构）
+    std::unique_lock<std::mutex> lock(m_queueMutex);
     m_notFull.wait(lock, [this] {
-        return m_stopFlag.load() || (m_QueueSize == -1 || m_TaskQueue.size() < m_QueueSize);
+        return m_stopFlag.load() || (m_QueueSize == -1 || (int)m_TaskQueue.size() < m_QueueSize);
     });
 
     if (m_stopFlag.load()) {
         throw std::runtime_error("submit on a stopped ThreadPool");
     }
 
-    auto task = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
-    m_TaskQueue.emplace_back(std::move(task));
+    try {
+        m_TaskQueue.emplace_back(std::move(task));
+    } catch (...) {
+        // emplace_back 可能抛（例如 bad_alloc），这里把异常向上抛给调用方
+        // 如果你想在 emplace_back 失败时改为在当前线程执行任务，可以在这里调用 `bound()`（谨慎）
+        throw;
+    }
 
+    // 解锁后通知消费者，减少唤醒后竞争锁的概率
+    lock.unlock();
     m_notEmpty.notify_one();
 }
 
